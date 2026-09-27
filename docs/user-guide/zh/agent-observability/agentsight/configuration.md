@@ -231,7 +231,12 @@ RPM 使用 `%config(noreplace)`，因此升级包不会覆盖磁盘上的文件�
 | `AGENTSIGHT_TOKENIZER_PATH` | 本地分词器模型所在目录 |
 | `AGENTSIGHT_ENFORCER_SOCKET` | enforcer socket 路径（默认 `/run/agentsight/enforcer.sock`） |
 | `AGENTSIGHT_CHROME_TRACE` | 输出 Chrome trace 文件用于流水线性能分析 |
+| `AGENTSIGHT_METRICS_FILE` | 将 Prometheus 运行时指标原子写入指定文件；未设置或设为空时关闭导出 |
+| `AGENTSIGHT_METRICS_INTERVAL_SECS` | 运行时指标快照的最短间隔，单位为正整数秒（默认 `1`）；仅在设置 `AGENTSIGHT_METRICS_FILE` 时使用 |
 | `RUST_LOG` | 日志级别，例如 `RUST_LOG=debug` |
+
+运行时指标的更新频率不会高于设置的间隔。退出时即使间隔尚未到期，也会写入最终快照。
+启用指标导出时，`0` 等无效间隔会导致启动失败。
 
 ## 改完怎么验证
 

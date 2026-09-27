@@ -41,6 +41,7 @@ use crate::interruption::{
 use crate::parser::Parser;
 use crate::probes::{ChannelWatermarks, FileWatchEvent, FileWriteEvent, Probes, ProbesPoller};
 use crate::response_map::ResponseSessionMapper;
+use crate::runtime_metrics::{MetricsFileExporter, RuntimeMetrics, record_event_received};
 use crate::storage::sqlite::{GenAISqliteStore, InterruptionStore, sibling_db_path};
 use crate::storage::{SqliteConfig, Storage, TimePeriod, TokenQuery, TokenQueryResult};
 use crate::tokenizer::LlmTokenizer;
@@ -124,6 +125,8 @@ pub struct AgentSight {
     process_killer: Arc<dyn crate::utils::process::ProcessKiller>,
     /// Cached feature flags so runtime paths can check them without the config.
     features: crate::config::FeatureFlags,
+    /// Optional atomic file exporter used by benchmark and operations tooling.
+    metrics_exporter: Option<MetricsFileExporter>,
 }
 
 /// GenAI events waiting for session_id resolution via ResponseSessionMapper.
@@ -567,6 +570,8 @@ impl AgentSight {
             Arc::clone(&resource_targets),
             Arc::clone(&running),
         );
+        let metrics_exporter = MetricsFileExporter::from_env()
+            .context("failed to configure AgentSight runtime metrics export")?;
 
         // Trajectory collector (Qoder/QoderWork JSONL → ATIF → trajectories.db).
         // Feature-gated (default off); the thread shares `running` as stop flag.
@@ -635,6 +640,7 @@ impl AgentSight {
             deadloop_kill_after_count: config.deadloop_kill_after_count,
             process_killer: Arc::new(crate::utils::process::LibcProcessKiller),
             features: config.features.clone(),
+            metrics_exporter,
         })
     }
 
@@ -858,6 +864,7 @@ impl AgentSight {
 
         let event = self.probes.try_recv()?;
         self.event_count += 1;
+        record_event_received(event.event_type());
 
         log::trace!("Processing event: {:?}", event.event_type());
 
@@ -1195,6 +1202,7 @@ impl AgentSight {
             // a saturated byte budget keeps the queue non-empty, which is exactly
             // when the watermarks matter most.
             self.maybe_log_buffer_watermarks();
+            self.maybe_export_runtime_metrics();
             if let Some(result) = self.try_process() {
                 log::trace!("[Event {result}] Processed");
             } else {
@@ -1214,6 +1222,7 @@ impl AgentSight {
 
         // On shutdown, flush all remaining pending events with fallback session_id
         self.flush_all_pending_genai();
+        self.export_final_runtime_metrics();
 
         Ok(self.event_count)
     }
@@ -1228,6 +1237,7 @@ impl AgentSight {
         }
         // Flush all pending GenAI events before exit
         self.flush_all_pending_genai();
+        self.export_final_runtime_metrics();
         // Checkpoint genai_events.db WAL so -wal/-shm are cleaned up on exit
         // (mirrors Storage::Drop which checkpoints agentsight.db).
         if let Some(ref store) = self.genai_sqlite_store {
@@ -2314,6 +2324,65 @@ impl AgentSight {
             log::info!("{report}");
         } else {
             log::debug!("{report}");
+        }
+    }
+
+    fn runtime_metrics(&self) -> Result<RuntimeMetrics> {
+        let channel = self.probes.channel_watermarks();
+        let connections = self.aggregator.connection_metrics();
+        Ok(RuntimeMetrics {
+            event_channel_bytes: channel.in_flight_bytes as u64,
+            event_channel_budget_bytes: channel.budget_bytes as u64,
+            channel_length: self.probes.channel_length() as u64,
+            channel_dropped: self.probes.channel_dropped() as u64,
+            ring_buffer_dropped: self.probes.ring_buffer_dropped()?,
+            connection_cache_bytes: connections.connection_cache_bytes as u64,
+            pending_genai_count: self.pending_genai.len() as u64,
+            pending_genai_bytes: self.pending_genai_bytes as u64,
+            pending_connection_count: connections.pending_connection_count as u64,
+            pending_connection_bytes: connections.pending_connection_bytes as u64,
+            eviction_count: connections.eviction_count,
+            completed: self.event_count,
+        })
+    }
+
+    fn maybe_export_runtime_metrics(&mut self) {
+        if !self
+            .metrics_exporter
+            .as_ref()
+            .is_some_and(MetricsFileExporter::is_due)
+        {
+            return;
+        }
+        let metrics = match self.runtime_metrics() {
+            Ok(metrics) => metrics,
+            Err(error) => {
+                log::warn!("Failed to read AgentSight runtime metrics: {error:#}");
+                return;
+            }
+        };
+        if let Some(exporter) = self.metrics_exporter.as_mut()
+            && let Err(error) = exporter.maybe_export(metrics)
+        {
+            log::warn!("Failed to export AgentSight runtime metrics: {error:#}");
+        }
+    }
+
+    fn export_final_runtime_metrics(&mut self) {
+        if self.metrics_exporter.is_none() {
+            return;
+        }
+        let metrics = match self.runtime_metrics() {
+            Ok(metrics) => metrics,
+            Err(error) => {
+                log::warn!("Failed to read final AgentSight runtime metrics: {error:#}");
+                return;
+            }
+        };
+        if let Some(exporter) = self.metrics_exporter.as_mut()
+            && let Err(error) = exporter.export(metrics)
+        {
+            log::warn!("Failed to export final AgentSight runtime metrics: {error:#}");
         }
     }
 }
