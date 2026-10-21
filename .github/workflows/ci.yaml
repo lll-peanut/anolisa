@@ -853,6 +853,178 @@ jobs:
           fi
 
   # =========================================================================
+  # Test AgentSight resources on a fixed kernel after the functional checks.
+  # =========================================================================
+  test-agentsight-resource:
+    name: Test agentsight resources
+    needs: [detect-changes, test-agentsight]
+    if: needs.detect-changes.outputs.agentsight == 'true'
+    runs-on: anolisa-agentsight-kernel66-x64
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+        working-directory: src/agentsight
+    env:
+      RUSTUP_TOOLCHAIN: '1.89.0'
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure resource test paths
+        run: |
+          echo "RESOURCE_OUTPUT=$RUNNER_TEMP/agentsight-resource-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+          echo "RESOURCE_DIAGNOSTICS=$RUNNER_TEMP/agentsight-resource-log-tails-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+          echo "XDG_CACHE_HOME=$RUNNER_TEMP/agentsight-resource-cache" >> "$GITHUB_ENV"
+          echo "PYTHON=$RUNNER_TEMP/agentsight-benchmark-venv/bin/python" >> "$GITHUB_ENV"
+
+      - name: Verify eBPF runner
+        run: |
+          case "$(uname -r)" in
+            6.6.*) ;;
+            *) echo "Expected Linux 6.6.x for resource measurements" >&2; exit 1 ;;
+          esac
+          sudo -n true
+          sudo test -r /sys/kernel/btf/vmlinux
+
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: rustfmt
+
+      - uses: astral-sh/setup-uv@v8.0.0
+        with:
+          python-version: '3.11.6'
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          cache-targets: false
+          workspaces: src/agentsight
+          cache-directories: |
+            ${{ env.XDG_CACHE_HOME }}/agentsight-benchmark/target
+            ${{ env.XDG_CACHE_HOME }}/agentsight-benchmark/tiktoken
+
+      - name: Install resource test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-15 llvm-15 libbpf-dev libelf-dev elfutils libssl-dev zlib1g-dev pkg-config perl openssl curl util-linux
+          echo "/usr/lib/llvm-15/bin" >> "$GITHUB_PATH"
+          uv venv --python 3.11.6 "$RUNNER_TEMP/agentsight-benchmark-venv"
+          uv pip install --python "$PYTHON" -r scripts/benchmark/requirements.txt
+
+      - name: Record resource test environment
+        run: |
+          {
+            uname -a
+            lscpu
+            free -m
+            df -h "$RUNNER_TEMP"
+            rustc --version
+            clang --version
+            "$PYTHON" --version
+            openssl version
+            sudo grep -E '^(Cap(Inh|Prm|Eff|Bnd|Amb)|NoNewPrivs|Seccomp):' /proc/self/status
+            cat /proc/self/cgroup
+            for resource_file in /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max /sys/fs/cgroup/cpuset.cpus.effective; do
+              if [[ -r "$resource_file" ]]; then
+                echo "$resource_file"
+                cat "$resource_file"
+              fi
+            done
+          } > "$RUNNER_TEMP/agentsight-resource-environment.txt"
+
+      - name: Test resource report and limit checks
+        run: |
+          "$PYTHON" -B -m pytest -q -p no:cacheprovider \
+            scripts/benchmark/tests/test_resource_limits.py \
+            scripts/benchmark/tests/test_resource_report.py \
+            scripts/benchmark/tests/test_resource_cpu_intervals.py
+
+      - name: Measure resource usage
+        run: |
+          # Serialize measurements on this host without canceling other PR jobs.
+          exec 9>/tmp/anolisa-agentsight-resource.lock
+          flock --timeout 1800 9
+          bash scripts/benchmark/single_run/resource_run.sh \
+            --candidate HEAD \
+            --agents 32 \
+            --connection-capacity 128 \
+            --payload-kb 1024 \
+            --tokens-per-second 100 \
+            --tokens-per-response 1000 \
+            --duration 300 \
+            --ring-buffer-mb 64 \
+            --cpu-budget-percent 25 \
+            --output-dir "$RESOURCE_OUTPUT" \
+            | tee "$RUNNER_TEMP/agentsight-resource-run.log"
+
+      - name: Enforce resource limits and publish summary
+        if: always()
+        run: |
+          python3 -B scripts/benchmark/single_run/check_resource_limits.py \
+            --summary "$RESOURCE_OUTPUT/resource-summary.json"
+
+      - name: Collect failure log tails (2 MiB per file)
+        if: failure()
+        run: |
+          mkdir -p "$RESOURCE_DIAGNOSTICS/run"
+          if [[ -n "${RESOURCE_OUTPUT:-}" && -d "$RESOURCE_OUTPUT" ]]; then
+            for resource_log in "$RESOURCE_OUTPUT"/*.log; do
+              if [[ -f "$resource_log" ]]; then
+                tail -c 2097152 -- "$resource_log" > "$RESOURCE_DIAGNOSTICS/${resource_log##*/}"
+              fi
+            done
+            for resource_log in "$RESOURCE_OUTPUT"/run/*.log; do
+              if [[ -f "$resource_log" ]]; then
+                tail -c 2097152 -- "$resource_log" > "$RESOURCE_DIAGNOSTICS/run/${resource_log##*/}"
+              fi
+            done
+          fi
+          if [[ -f "$RUNNER_TEMP/agentsight-resource-run.log" ]]; then
+            tail -c 2097152 -- "$RUNNER_TEMP/agentsight-resource-run.log" \
+              > "$RESOURCE_DIAGNOSTICS/agentsight-resource-run.log"
+          fi
+
+      - name: Upload resource reports and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentsight-resources-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/agentsight-resource-environment.txt
+            ${{ env.RESOURCE_OUTPUT }}/resource-report.txt
+            ${{ env.RESOURCE_OUTPUT }}/resource-summary.json
+            ${{ env.RESOURCE_OUTPUT }}/settings.json
+            ${{ env.RESOURCE_OUTPUT }}/inputs.json
+            ${{ env.RESOURCE_OUTPUT }}/configuration.json
+            ${{ env.RESOURCE_OUTPUT }}/run-error.txt
+            ${{ env.RESOURCE_OUTPUT }}/run/benchmark-report.md
+            ${{ env.RESOURCE_OUTPUT }}/run/run-summary.json
+            ${{ env.RESOURCE_OUTPUT }}/run/report.json
+            ${{ env.RESOURCE_OUTPUT }}/run/agent-summary.json
+            ${{ env.RESOURCE_OUTPUT }}/run/worker-result.json
+            ${{ env.RESOURCE_OUTPUT }}/run/capture-readiness.json
+            ${{ env.RESOURCE_OUTPUT }}/run/safety-stop.json
+            ${{ env.RESOURCE_OUTPUT }}/run/metrics.csv
+            ${{ env.RESOURCE_OUTPUT }}/run/internal-metrics.prom
+            ${{ env.RESOURCE_DIAGNOSTICS }}/
+
+      - name: Clean resource results
+        if: always()
+        run: |
+          rm -rf -- "$RUNNER_TEMP/agentsight-benchmark-venv" \
+            "$RUNNER_TEMP/agentsight-resource-log-tails-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          rm -f -- "$RUNNER_TEMP/agentsight-resource-environment.txt" \
+            "$RUNNER_TEMP/agentsight-resource-run.log"
+          if [[ "${RESOURCE_OUTPUT:-}" == "$RUNNER_TEMP/agentsight-resource-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ]]; then
+            sudo -n rm -rf -- "$RESOURCE_OUTPUT"
+          fi
+
+  # =========================================================================
   # Step 6: Test tokenless
   # =========================================================================
   test-tokenless:
