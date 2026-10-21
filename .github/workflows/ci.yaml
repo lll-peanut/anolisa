@@ -287,7 +287,7 @@ jobs:
           retention-days: 1
 
   # =========================================================================
-  # Step 3: Test copilot-shell (cli + core in parallel)
+  # Step 4: Test copilot-shell (cli + core in parallel)
   # =========================================================================
   test-copilot-shell-cli:
     name: Test copilot-shell/cli
@@ -350,7 +350,7 @@ jobs:
           NO_COLOR=true npm run test:ci --workspace=@copilot-shell/core
 
   # =========================================================================
-  # Step 4: Test agent-sec-core (Linux only)
+  # Step 5: Test agent-sec-core (Linux only)
   # =========================================================================
   test-agent-sec-core:
     name: Test agent-sec-core
@@ -667,7 +667,7 @@ jobs:
           fi
 
   # =========================================================================
-  # Step 5: Test agentsight (Linux only)
+  # Step 6: Test agentsight (Linux only)
   # =========================================================================
   test-agentsight:
     name: Test agentsight
@@ -853,7 +853,7 @@ jobs:
           fi
 
   # =========================================================================
-  # Test AgentSight resources on a fixed kernel after the functional checks.
+  # Step 7: Test AgentSight resources on a fixed kernel after the functional checks.
   # =========================================================================
   test-agentsight-resource:
     name: Test agentsight resources
@@ -1025,7 +1025,7 @@ jobs:
           fi
 
   # =========================================================================
-  # Step 6: Test tokenless
+  # Step 8: Test tokenless
   # =========================================================================
   test-tokenless:
     name: Test tokenless
@@ -1211,7 +1211,7 @@ jobs:
           test -x ./node_modules/anolisa-tokenless/adapters/tokenless/openclaw/scripts/install.sh
 
   # =========================================================================
-  # Step 7: Test ws-ckpt
+  # Step 9: Test ws-ckpt
   # =========================================================================
   test-ws-ckpt:
     name: Test ws-ckpt
@@ -1304,7 +1304,7 @@ jobs:
 
 
   # =========================================================================
-  # Step 8: Test agent-memory (Linux-only Rust crate)
+  # Step 10: Test agent-memory (Linux-only Rust crate)
   # =========================================================================
   test-agent-memory:
     name: Test agent-memory
@@ -1372,7 +1372,7 @@ jobs:
           make test-openclaw-plugin
 
   # =========================================================================
-  # Step 9: Test anolisa (Rust workspace)
+  # Step 11: Test anolisa (Rust workspace)
   # =========================================================================
   test-anolisa:
     name: Test anolisa
@@ -1493,7 +1493,7 @@ jobs:
           retention-days: 14
 
   # =========================================================================
-  # Step 10: Test SkillFS (Rust workspace)
+  # Step 12: Test SkillFS (Rust workspace)
   # =========================================================================
   test-skillfs:
     name: Test SkillFS
@@ -1546,7 +1546,7 @@ jobs:
           scripts/test.sh
 
   # =========================================================================
-  # Step 11: Test cosh-ng (Rust workspace)
+  # Step 13: Test cosh-ng (Rust workspace)
   # =========================================================================
   # Integration uses three complete target shards and the historical
   # "Test cosh-ng" aggregate check. Fast checks and release build remain
@@ -1708,7 +1708,7 @@ jobs:
           cargo build --workspace --release --locked
 
   # =========================================================================
-  # Step 12: Test ktuner (deterministic kernel-tuning engine)
+  # Step 14: Test ktuner (deterministic kernel-tuning engine)
   # =========================================================================
   test-ktuner:
     name: Test ktuner
