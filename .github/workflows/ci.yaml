@@ -902,6 +902,7 @@ jobs:
         with:
           cache-bin: false
           cache-targets: false
+          cache-on-failure: true
           workspaces: src/agentsight
           cache-directories: |
             ${{ env.XDG_CACHE_HOME }}/agentsight-benchmark/target
