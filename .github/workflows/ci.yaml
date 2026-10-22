@@ -954,6 +954,7 @@ jobs:
           # Serialize measurements on this host without canceling other PR jobs.
           exec 9>/tmp/anolisa-agentsight-resource.lock
           flock --timeout 1800 9
+          resource_status=0
           bash scripts/benchmark/single_run/resource_run.sh \
             --candidate HEAD \
             --agents 32 \
@@ -965,7 +966,68 @@ jobs:
             --ring-buffer-mb 64 \
             --cpu-budget-percent 25 \
             --output-dir "$RESOURCE_OUTPUT" \
-            | tee "$RUNNER_TEMP/agentsight-resource-run.log"
+            | tee "$RUNNER_TEMP/agentsight-resource-run.log" || resource_status=$?
+
+          # Keep the host lock while collecting diagnostics so other measurements stay isolated.
+          if (( resource_status != 0 )) && [[ -f "$RESOURCE_OUTPUT/run/worker-result.json" ]]; then
+            if ! sudo -n -- "$PYTHON" - "$RESOURCE_OUTPUT" <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          output = Path(sys.argv[1])
+          directory = output / "run"
+          result = json.loads((directory / "worker-result.json").read_text())
+          if not result.get("error", "").startswith((
+              "AgentSight exited during startup (",
+              "AgentSight initialization timed out;",
+          )):
+              print("Skipping startup diagnostics: no AgentSight startup failure reported.")
+              sys.exit(0)
+
+          diagnostics = output / "startup-diagnostics"
+          diagnostics.mkdir()
+          config = json.loads((directory / "config.json").read_text())
+          config["verbose"] = 1
+          config.pop("log_path", None)
+          config.setdefault("storage", {})["base_path"] = str(diagnostics / "db")
+          config_path = diagnostics / "config.json"
+          config_path.write_text(json.dumps(config, indent=2) + "\n")
+          job = json.loads((directory / "job.json").read_text())
+          env = dict(
+              os.environ,
+              **job["env"],
+              RUST_LOG="info",
+              AGENTSIGHT_METRICS_FILE=str(diagnostics / "internal-metrics.prom"),
+          )
+          log_path = directory / "libbpf-startup.log"
+          print("Diagnosing AgentSight startup with verbose libbpf logging (20 s limit).", flush=True)
+          with log_path.open("wb") as log:
+              diagnostic = subprocess.run(
+                  [
+                      "timeout", "--signal=INT", "--kill-after=5s", "20s",
+                      job["binary"], "trace", "--verbose", "--config", str(config_path),
+                  ],
+                  env=env,
+                  stdout=log,
+                  stderr=subprocess.STDOUT,
+                  check=False,
+              )
+          (diagnostics / "result.json").write_text(
+              json.dumps({"returncode": diagnostic.returncode}, indent=2) + "\n"
+          )
+          print(f"Startup diagnostic exit code: {diagnostic.returncode}; log: {log_path}")
+          PY
+            then
+              echo "::warning::AgentSight startup diagnostics could not complete"
+            fi
+            if [[ -f "$RESOURCE_OUTPUT/run/libbpf-startup.log" ]]; then
+              tail -n 80 -- "$RESOURCE_OUTPUT/run/libbpf-startup.log"
+            fi
+          fi
+          exit "$resource_status"
 
       - name: Enforce resource limits and publish summary
         if: always()
@@ -1017,6 +1079,8 @@ jobs:
             ${{ env.RESOURCE_OUTPUT }}/run/safety-stop.json
             ${{ env.RESOURCE_OUTPUT }}/run/metrics.csv
             ${{ env.RESOURCE_OUTPUT }}/run/internal-metrics.prom
+            ${{ env.RESOURCE_OUTPUT }}/startup-diagnostics/config.json
+            ${{ env.RESOURCE_OUTPUT }}/startup-diagnostics/result.json
             ${{ env.RESOURCE_DIAGNOSTICS }}/
 
       - name: Clean resource results
