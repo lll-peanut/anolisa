@@ -890,6 +890,54 @@ jobs:
           sudo -n true
           sudo test -r /sys/kernel/btf/vmlinux
 
+          tracefs_failure() {
+            local tracefs_status="$1"
+            local tracefs_command="$2"
+            trap - ERR
+            set +e
+            mkdir -p "$RESOURCE_DIAGNOSTICS"
+            {
+              echo "::error::Tracefs preparation failed (exit $tracefs_status): $tracefs_command"
+              uname -a
+              findmnt -t tracefs,debugfs
+              cat /proc/self/mountinfo
+              cat /proc/self/cgroup
+              sudo -n grep -E '^(Cap(Eff|Bnd)|NoNewPrivs|Seccomp):' /proc/self/status
+              for tracefs_root in /sys/kernel/tracing /sys/kernel/debug/tracing; do
+                sudo -n ls -ld "$tracefs_root" "$tracefs_root/events" "$tracefs_root/events/syscalls"
+                sudo -n ls -l "$tracefs_root/events/syscalls/sys_exit_execve"
+                sudo -n grep -E 'syscalls:sys_(enter_execve|exit_execve|enter_write)|sched:sched_process_exit' \
+                  "$tracefs_root/available_events"
+              done
+              for tracefs_config in /proc/config.gz "/boot/config-$(uname -r)"; do
+                if sudo -n test -r "$tracefs_config"; then
+                  echo "Kernel config: $tracefs_config"
+                  if [[ "$tracefs_config" == *.gz ]]; then
+                    sudo -n gzip -dc "$tracefs_config"
+                  else
+                    sudo -n cat "$tracefs_config"
+                  fi | grep -E 'CONFIG_(FTRACE|HAVE_SYSCALL_TRACEPOINTS|BPF_SYSCALL|PERF_EVENTS)'
+                else
+                  echo "Kernel config unavailable: $tracefs_config"
+                fi
+              done
+            } 2>&1 | tee "$RESOURCE_DIAGNOSTICS/tracefs-environment.log"
+            exit "$tracefs_status"
+          }
+          trap 'tracefs_failure "$?" "$BASH_COMMAND"' ERR
+
+          if ! findmnt --mountpoint /sys/kernel/tracing \
+              --types tracefs --noheadings >/dev/null; then
+            sudo -n mkdir -p /sys/kernel/tracing
+            sudo -n mount -t tracefs nodev /sys/kernel/tracing
+          fi
+          for tracefs_event in syscalls/sys_enter_execve syscalls/sys_exit_execve \
+              syscalls/sys_enter_write sched/sched_process_exit; do
+            echo "Checking tracepoint: $tracefs_event"
+            sudo -n cat "/sys/kernel/tracing/events/$tracefs_event/id"
+          done
+          trap - ERR
+
       - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: rustfmt
