@@ -99,37 +99,24 @@ jobs:
           "$PYTHON" .github/scripts/agentsight-genai-diagnostics.py measure \
             --output "$EXPERIMENT_OUTPUT/native25" --binary "$EXPERIMENT_OUTPUT/binaries/native"
 
-      - name: Ordinary build with external blocking stacks, diagnostic measurement
-        continue-on-error: true
+      - name: Disable capacity pruning but retain periodic checkpoints
         run: |
-          "$PYTHON" .github/scripts/agentsight-ring-diagnostics.py run \
-            --output "$EXPERIMENT_OUTPUT/native25-blocking" --binary "$EXPERIMENT_OUTPUT/binaries/native"
-
-      - name: Ordinary build without pacing, diagnostic comparison only
-        run: |
-          "$PYTHON" .github/scripts/agentsight-genai-diagnostics.py measure \
-            --output "$EXPERIMENT_OUTPUT/native0" --binary "$EXPERIMENT_OUTPUT/binaries/native" \
-            --cpu-budget 0
-
-      - name: Disable periodic SQLite maintenance, diagnostic comparison only
-        run: |
-          "$PYTHON" - <<'PY'
+          "$PYTHON" - <<'PYCONFIG'
           import json
           import os
           from pathlib import Path
           config = json.loads(Path('src/agentsight/agentsight.json').read_text())
           storage = config.setdefault('storage', {})
           storage['max_total_size_mb'] = 0
-          for store in ('primary', 'genai', 'interruptions', 'trajectories', 'optimization',
-                        'security_audit', 'reuse', 'causal', 'enforcement'):
-              storage.setdefault(store, {})['check_interval_secs'] = 0
-          path = Path(os.environ['EXPERIMENT_OUTPUT']) / 'no-periodic-maintenance.json'
+          for store in ('primary', 'genai'):
+              storage.setdefault(store, {})['max_db_size_mb'] = 0
+          path = Path(os.environ['EXPERIMENT_OUTPUT']) / 'no-capacity-pruning.json'
           path.write_text(json.dumps(config, indent=2) + '\n')
-          PY
+          PYCONFIG
           "$PYTHON" .github/scripts/agentsight-genai-diagnostics.py measure \
-            --output "$EXPERIMENT_OUTPUT/native25-no-maintenance" \
+            --output "$EXPERIMENT_OUTPUT/native25-no-capacity-pruning" \
             --binary "$EXPERIMENT_OUTPUT/binaries/native" \
-            --config "$EXPERIMENT_OUTPUT/no-periodic-maintenance.json"
+            --config "$EXPERIMENT_OUTPUT/no-capacity-pruning.json"
 
       - name: Summarize diagnostic evidence
         if: always()
