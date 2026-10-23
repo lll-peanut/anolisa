@@ -82,40 +82,54 @@ jobs:
           "$PYTHON" .github/scripts/agentsight-genai-diagnostics.py sha \
             --output "$EXPERIMENT_OUTPUT/sha.json"
 
-      - name: Build ordinary and software SHA binaries from the same source
+      - name: Build ordinary SHA-accelerated binary
         working-directory: src/agentsight
         run: |
           cargo build --release --locked --bin agentsight \
             2>&1 | tee "$EXPERIMENT_OUTPUT/build-native.log"
           cp "$CARGO_TARGET_DIR/release/agentsight" "$EXPERIMENT_OUTPUT/binaries/native"
-          cargo build --release --locked --bin agentsight --features sha2/force-soft \
-            2>&1 | tee "$EXPERIMENT_OUTPUT/build-soft.log"
-          cp "$CARGO_TARGET_DIR/release/agentsight" "$EXPERIMENT_OUTPUT/binaries/soft"
-          cargo tree --locked -e features -i sha2 --features sha2/force-soft \
-            > "$EXPERIMENT_OUTPUT/software-sha-features.txt"
           sha256sum "$EXPERIMENT_OUTPUT/binaries/"* > "$EXPERIMENT_OUTPUT/binaries.sha256"
+          "$PYTHON" - <<'PY'
+          from pathlib import Path
+          assert 'sha_ni' in Path('/proc/cpuinfo').read_text(), 'Runner must expose SHA acceleration'
+          PY
 
       - name: Ordinary build, original 300-second profile
         run: |
           "$PYTHON" .github/scripts/agentsight-genai-diagnostics.py measure \
             --output "$EXPERIMENT_OUTPUT/native25" --binary "$EXPERIMENT_OUTPUT/binaries/native"
 
-      - name: Software SHA, original 300-second profile
+      - name: Ordinary build with external blocking stacks, diagnostic measurement
+        continue-on-error: true
         run: |
-          "$PYTHON" .github/scripts/agentsight-genai-diagnostics.py measure \
-            --output "$EXPERIMENT_OUTPUT/soft25" --binary "$EXPERIMENT_OUTPUT/binaries/soft"
+          "$PYTHON" .github/scripts/agentsight-ring-diagnostics.py run \
+            --output "$EXPERIMENT_OUTPUT/native25-blocking" --binary "$EXPERIMENT_OUTPUT/binaries/native"
 
-      - name: Software SHA without pacing, diagnostic comparison only
+      - name: Ordinary build without pacing, diagnostic comparison only
         run: |
           "$PYTHON" .github/scripts/agentsight-genai-diagnostics.py measure \
-            --output "$EXPERIMENT_OUTPUT/soft0" --binary "$EXPERIMENT_OUTPUT/binaries/soft" \
+            --output "$EXPERIMENT_OUTPUT/native0" --binary "$EXPERIMENT_OUTPUT/binaries/native" \
             --cpu-budget 0
 
-      - name: Software SHA CPU profile, separate from the original measurements
+      - name: Disable periodic SQLite maintenance, diagnostic comparison only
         run: |
+          "$PYTHON" - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          config = json.loads(Path('src/agentsight/agentsight.json').read_text())
+          storage = config.setdefault('storage', {})
+          storage['max_total_size_mb'] = 0
+          for store in ('primary', 'genai', 'interruptions', 'trajectories', 'optimization',
+                        'security_audit', 'reuse', 'causal', 'enforcement'):
+              storage.setdefault(store, {})['check_interval_secs'] = 0
+          path = Path(os.environ['EXPERIMENT_OUTPUT']) / 'no-periodic-maintenance.json'
+          path.write_text(json.dumps(config, indent=2) + '\n')
+          PY
           "$PYTHON" .github/scripts/agentsight-genai-diagnostics.py measure \
-            --output "$EXPERIMENT_OUTPUT/soft-profile" --binary "$EXPERIMENT_OUTPUT/binaries/soft" \
-            --duration 90 --profile
+            --output "$EXPERIMENT_OUTPUT/native25-no-maintenance" \
+            --binary "$EXPERIMENT_OUTPUT/binaries/native" \
+            --config "$EXPERIMENT_OUTPUT/no-periodic-maintenance.json"
 
       - name: Summarize diagnostic evidence
         if: always()
@@ -135,6 +149,7 @@ jobs:
             ${{ env.EXPERIMENT_OUTPUT }}/*.txt
             ${{ env.EXPERIMENT_OUTPUT }}/*.log
             ${{ env.EXPERIMENT_OUTPUT }}/*.sha256
+            ${{ env.EXPERIMENT_OUTPUT }}/*.gz
             ${{ env.EXPERIMENT_OUTPUT }}/*/resource-summary.json
             ${{ env.EXPERIMENT_OUTPUT }}/*/resource-report.txt
             ${{ env.EXPERIMENT_OUTPUT }}/*/settings.json

@@ -286,6 +286,7 @@ def measure(args: argparse.Namespace) -> None:
         str(args.cpu_budget),
         "--output-dir",
         str(output),
+        *(["--config", str(args.config.resolve())] if args.config else []),
     ]
     try:
         result = subprocess.run(command, cwd=ROOT / "src/agentsight", check=False)
@@ -329,6 +330,7 @@ def main() -> None:
     parser.add_argument("mode", choices=("environment", "sha", "watch", "measure", "summarize"))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--binary", type=Path)
+    parser.add_argument("--config", type=Path)
     parser.add_argument("--duration", type=int, default=300)
     parser.add_argument("--cpu-budget", type=int, default=25)
     parser.add_argument("--run-dir", type=Path)
