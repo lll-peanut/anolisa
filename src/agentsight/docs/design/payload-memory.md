@@ -13,6 +13,12 @@ Executable SSL scans use vectorized substring searches in bounded 4 MiB windows 
 overlap. Every overlapping match and cross-window start is preserved; inode caching and symbol
 selection keep their existing behavior.
 
+Slow static SSL signature detection runs on one worker with at most 32 in-flight executable files,
+including completed results. Jobs pin file descriptors and share the configured process CPU budget
+between 4 MiB windows. The event owner installs global uprobes only for unchanged files with live
+process references; symbol and known-offset fast paths stay synchronous. Shutdown cancels and joins
+the worker. Discovery of a previously unseen static binary remains best-effort while its scan runs.
+
 ```mermaid
 flowchart LR
     Probe[Probe payload] --> Capture[Queue with slot and byte limits]
