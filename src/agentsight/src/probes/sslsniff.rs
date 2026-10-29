@@ -30,10 +30,11 @@ use std::{
 
 mod scan;
 mod scan_jobs;
+use crate::utils::cpu_budget::{CpuBudget, WorkClass};
 #[cfg(test)]
 use scan::ssl_exe_markers;
 use scan::{collect_pattern_hits, file_has_ssl_markers, fill_buf};
-use crate::utils::cpu_budget::{CpuBudget, WorkClass};
+use scan_jobs::SubmitError;
 
 // ─── Generated skeleton ───────────────────────────────────────────────────────
 #[allow(
@@ -102,6 +103,8 @@ enum AttachOutcome {
     /// Transient attach failure; the caller unmarks the file so a later
     /// sweep can retry.
     Failed,
+    /// The bounded scan queue is full; retry after a short backoff.
+    ScanQueueFull,
     /// Keep the inode association while a bounded worker inspects its bytes.
     Deferred,
 }
@@ -337,6 +340,8 @@ pub struct SslSniff {
     /// How many stale attachments have been re-attached (diagnostics/tests).
     stale_reattachs: u64,
     scans: scan_jobs::ScanJobs,
+    /// Retry deadlines for files that arrived while the bounded scan queue was full.
+    scan_retry_after: HashMap<FileKey, Instant>,
     // Channel for user-space SslEvent (lightweight, no need for Box)
     tx: crossbeam_channel::Sender<SslEvent>,
     rx: crossbeam_channel::Receiver<SslEvent>,
@@ -397,6 +402,7 @@ impl SslSniff {
             reattach_ttl: stale_reattach_ttl(),
             stale_reattachs: 0,
             scans: scan_jobs::ScanJobs::new()?,
+            scan_retry_after: HashMap::default(),
             tx,
             rx,
         })
@@ -419,7 +425,13 @@ impl SslSniff {
             // other Bun-compiled executables). Fall back to content detection
             // on the main executable; the normal Static attach path (symbols →
             // offset table → byte patterns) takes over from here.
-            if let Some(entry) = probe_exe_static_ssl(pid, &mut self.traced_files) {
+            let now = Instant::now();
+            let retryable = self
+                .scan_retry_after
+                .iter()
+                .filter_map(|(file, retry_after)| (*retry_after <= now).then_some(*file))
+                .collect::<HashSet<_>>();
+            if let Some(entry) = probe_exe_static_ssl(pid, &mut self.traced_files, &retryable) {
                 libs.push(entry);
             }
         }
@@ -450,13 +462,21 @@ impl SslSniff {
             // cannot query liveness, so treat attachments older than the TTL
             // as stale and re-attach.
             if !self.traced_files.insert(file) {
+                let retry_overflow = self
+                    .scan_retry_after
+                    .get(&file)
+                    .is_some_and(|retry_after| *retry_after <= now);
+                let retry_blocked = self
+                    .scan_retry_after
+                    .get(&file)
+                    .is_some_and(|retry_after| *retry_after > now);
                 let stale = match self.attachments.get(&file) {
                     Some(a) => now.duration_since(a.attached_at) >= self.reattach_ttl,
                     // Marked but never attached: an Untraceable binary. Nothing
                     // to re-attach; rescanning it every sweep is wasted work.
                     None => false,
                 };
-                if !stale {
+                if retry_blocked || (!stale && !retry_overflow) {
                     log::debug!("[attach_process] pid={pid}: skipping already-traced {path}");
                     // Still record the pid→file association so detach_process
                     // can track all pids referencing this file.
@@ -477,12 +497,19 @@ impl SslSniff {
                             age_secs.unwrap_or(0)
                         );
                         self.record_attach(file, links);
+                        self.scan_retry_after.remove(&file);
                         self.stale_reattachs += 1;
                         attached_files.push(file);
                     }
-                    AttachOutcome::Untraceable
-                    | AttachOutcome::Failed
-                    | AttachOutcome::Deferred => {
+                    AttachOutcome::ScanQueueFull => {
+                        self.defer_scan_retry(file, &path);
+                        attached_files.push(file);
+                    }
+                    AttachOutcome::Deferred => {
+                        self.scan_retry_after.remove(&file);
+                        attached_files.push(file);
+                    }
+                    AttachOutcome::Untraceable | AttachOutcome::Failed => {
                         log::warn!(
                             "[attach_process] pid={pid}: stale re-attach failed for {path}; keeping previous links"
                         );
@@ -495,6 +522,7 @@ impl SslSniff {
             match self.build_attach(pid, &path, kind, &mapped_path) {
                 AttachOutcome::Attached(links) => {
                     self.record_attach(file, links);
+                    self.scan_retry_after.remove(&file);
                     attached_files.push(file);
                 }
                 AttachOutcome::Untraceable => {
@@ -504,8 +532,16 @@ impl SslSniff {
                 AttachOutcome::Failed => {
                     // Attach failed: drop the file so a later retry can succeed.
                     self.traced_files.remove(&file);
+                    self.scan_retry_after.remove(&file);
                 }
-                AttachOutcome::Deferred => attached_files.push(file),
+                AttachOutcome::Deferred => {
+                    self.scan_retry_after.remove(&file);
+                    attached_files.push(file);
+                }
+                AttachOutcome::ScanQueueFull => {
+                    self.defer_scan_retry(file, &path);
+                    attached_files.push(file);
+                }
             }
         }
 
@@ -530,7 +566,7 @@ impl SslSniff {
     }
 
     /// Install completed scans on the BPF-owning thread, retaining inode checks.
-    pub(crate) fn poll_pending_scans(&mut self) {
+    pub fn poll_pending_scans(&mut self) {
         for _ in 0..4 {
             let Some(scanned) = self.scans.try_recv() else {
                 break;
@@ -538,17 +574,21 @@ impl SslSniff {
             let file = scanned.key;
             if !scanned.unchanged {
                 self.traced_files.remove(&file);
+                self.scan_retry_after.remove(&file);
                 log::warn!("SSL scan input changed; retry discovery for inode {file:?}");
                 continue;
             }
+            let path = scanned.path();
             let Some(offsets) = scanned.offsets.as_ref() else {
+                self.scan_retry_after.remove(&file);
+                log::warn!("SSL byte-pattern detection failed for {path}; skipping");
                 continue;
             };
             if !self.pid_inodes.values().any(|files| files.contains(&file)) {
                 self.traced_files.remove(&file);
+                self.scan_retry_after.remove(&file);
                 continue;
             }
-            let path = scanned.path();
             match attach_static_ssl_by_offset(&mut self.skel, &path, offsets, false, -1) {
                 Ok(links) => {
                     if self.attachments.contains_key(&file) {
@@ -556,10 +596,12 @@ impl SslSniff {
                     }
                     self.record_attach(file, links);
                     self.traced_files.insert(file);
+                    self.scan_retry_after.remove(&file);
                 }
                 Err(error) => {
                     log::warn!("Attach asynchronously detected SSL inode {file:?}: {error:#}");
                     self.traced_files.remove(&file);
+                    self.scan_retry_after.remove(&file);
                 }
             }
         }
@@ -586,6 +628,19 @@ impl SslSniff {
                 attached_at: Instant::now(),
             },
         );
+    }
+
+    fn defer_scan_retry(&mut self, file: FileKey, path: &str) {
+        let now = Instant::now();
+        let should_warn = self
+            .scan_retry_after
+            .get(&file)
+            .is_none_or(|retry_after| *retry_after <= now);
+        if should_warn {
+            log::warn!("SSL scan queue is full; deferring byte-pattern detection for {path}");
+        }
+        self.scan_retry_after
+            .insert(file, now + Duration::from_secs(1));
     }
 
     /// Attach uprobes for a single SSL library.
@@ -683,8 +738,8 @@ impl SslSniff {
                         }
                         return match self.scans.submit(path) {
                             Ok(()) => AttachOutcome::Deferred,
-                            Err(scan_jobs::SubmitError::QueueFull)
-                            | Err(scan_jobs::SubmitError::Failed(error)) => {
+                            Err(SubmitError::QueueFull) => AttachOutcome::ScanQueueFull,
+                            Err(SubmitError::Failed(error)) => {
                                 log::warn!(
                                     "Schedule SSL byte-pattern detection for pid={pid}, {path}: {error:#}"
                                 );
@@ -720,6 +775,7 @@ impl SslSniff {
                     .any(|other_file| other_file == file);
                 if !still_used {
                     self.traced_files.remove(file);
+                    self.scan_retry_after.remove(file);
                     // Drop the attachment too: releasing the Links detaches the
                     // (now unneeded) global uprobes and keeps `attachments`
                     // consistent with `traced_files`. A later process mapping
@@ -907,85 +963,6 @@ fn scan_file_patterns_admitted<G>(
         carry = overlap;
     }
     Some(hits)
-}
-
-/// Probe the main executable of `pid` for statically-linked SSL when maps
-/// named no known SSL library.
-///
-/// Returns a synthetic `Static` lib entry (attach path `<pid>/exe`) after a
-/// marker prefilter passes, so the normal attach flow — `(dev, inode)`
-/// dedup, symbol attach, offset table, byte-pattern scan — applies
-/// unchanged. Returns `None` when the exe is unreadable, already present in
-/// `traced` (including Untraceable-marked), or carries no SSL marker; a
-/// marker miss is itself negatively cached in `traced`, because the marker
-/// set is an immutable property of the file — without this, a long-lived
-/// process that matches a domain rule but carries no BoringSSL would pay a
-/// full executable read on every DNS event.
-fn probe_exe_static_ssl(
-    pid: i32,
-    traced: &mut HashSet<FileKey>,
-) -> Option<(String, FileKey, SslLibKind, String)> {
-    let exe = proc_pid_entry(pid, "exe");
-    // Never treat Python interpreters as statically-linked BoringSSL via exe
-    // content probing: Python stubs/binaries may accidentally contain marker
-    // strings and must go through the normal OpenSSL/uv-python paths instead.
-    if let Ok(link) = fs::read_link(&exe) {
-        let name = Path::new(&link).file_name()?.to_string_lossy();
-        if name.starts_with("python") {
-            return None;
-        }
-    }
-    let meta = fs::metadata(&exe).ok()?;
-    use std::os::unix::fs::MetadataExt;
-    let key = (stat_dev_to_key(meta.dev()), meta.ino());
-    // Already traced, or previously scanned and marked Untraceable: skip the
-    // prefilter entirely. Without this check a binary that fails the
-    // byte-pattern scan (e.g. arm64, x86_64-only patterns) would be fully
-    // re-read on every attach sweep.
-    if traced.contains(&key) {
-        return None;
-    }
-    let exe_str = exe.to_string_lossy().into_owned();
-    if !file_has_ssl_markers(&exe_str) {
-        log::debug!(
-            "[attach_process] pid={pid}: no SSL markers in main executable, skipping content probe"
-        );
-        // Negative cache (Untraceable semantics: in traced_files, never in
-        // attachments, therefore never re-scanned).
-        traced.insert(key);
-        return None;
-    }
-    log::info!(
-        "[attach_process] pid={pid}: SSL markers found in main executable, probing for static SSL"
-    );
-    // Prefer the resolved on-disk path over `<pid>/exe` as the uprobe
-    // target: detection can take seconds (byte-pattern scan), and a
-    // short-lived process (a one-shot `opencode run`) exits before the
-    // attach completes, taking `<pid>/exe` down with it and failing the
-    // uprobe. The resolved path survives the exit, and the probe is
-    // inode-global anyway. Fall back to `<pid>/exe` when readlink fails or
-    // the file was replaced underneath (inode no longer matches).
-    let attach_path = match fs::read_link(&exe) {
-        Ok(target) => {
-            let resolved = target.to_string_lossy().into_owned();
-            match fs::metadata(&resolved) {
-                Ok(m) if (stat_dev_to_key(m.dev()), m.ino()) == key => resolved,
-                _ => exe_str.clone(),
-            }
-        }
-        Err(_) => exe_str.clone(),
-    };
-    Some((attach_path, key, SslLibKind::Static, exe_str))
-}
-
-/// Translate a `stat(2)` `st_dev` into the `FileKey` device encoding used by
-/// [`parse_maps_dev`] (major in the high 32 bits), so the same binary keys
-/// identically whether discovered through maps or through metadata.
-fn stat_dev_to_key(dev: u64) -> u64 {
-    // glibc major()/minor() unpacking of a dev_t.
-    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff_u64);
-    let minor = (dev & 0xff) | ((dev >> 12) & !0xff_u64);
-    (major << 32) | minor
 }
 
 #[cfg(test)]
@@ -1194,6 +1171,7 @@ pub(super) fn cosh_tap_present(path: &str) -> bool {
 fn probe_exe_static_ssl(
     pid: i32,
     traced: &mut HashSet<FileKey>,
+    retryable: &HashSet<FileKey>,
 ) -> Option<(String, FileKey, SslLibKind, String)> {
     let exe = proc_pid_entry(pid, "exe");
     // Never treat Python interpreters as statically-linked BoringSSL via exe
@@ -1212,11 +1190,11 @@ fn probe_exe_static_ssl(
     // prefilter entirely. Without this check a binary that fails the
     // byte-pattern scan (e.g. arm64, x86_64-only patterns) would be fully
     // re-read on every attach sweep.
-    if traced.contains(&key) {
+    if traced.contains(&key) && !retryable.contains(&key) {
         return None;
     }
     let exe_str = exe.to_string_lossy().into_owned();
-    if !file_has_ssl_markers(&exe_str) {
+    if !retryable.contains(&key) && !file_has_ssl_markers(&exe_str) {
         log::debug!(
             "[attach_process] pid={pid}: no SSL markers in main executable, skipping content probe"
         );
