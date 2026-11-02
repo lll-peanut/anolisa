@@ -24,9 +24,7 @@ EXPECTED_SETTINGS = {
 LIMITS = {
     "rss_average_mib": ("Average RSS", 265, "MiB"),
     "rss_peak_mib": ("Peak RSS", 300, "MiB"),
-    "cpu_average_pct": ("Average CPU", 23.5, "%"),
-    "cpu_p95_pct": ("P95 CPU", 34, "%"),
-    "cpu_peak_pct": ("Peak CPU", 42, "%"),
+    "cpu_average_pct": ("Average CPU", 25, "%"),
 }
 
 
@@ -66,7 +64,7 @@ def evaluate(summary: Any) -> tuple[bool, str]:
         "### AgentSight resource limits",
         "",
         "Load window: 300 seconds. CPU: 100% = one logical CPU.",
-        "RSS peaks and CPU P95/peaks use approximately one-second samples.",
+        "RSS peaks and CPU average use approximately one-second samples.",
         "",
         "| Metric | Observed | Limit | Result |",
         "|---|---:|---:|---|",

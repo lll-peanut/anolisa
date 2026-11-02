@@ -175,9 +175,24 @@ def summarize(directory: Path, source: dict[str, Any]) -> dict[str, Any]:
         and ffi_error is None
     )
     capture_counts = {}
-    for key in ("sent", "matched", "complete", "missing_count", "token_correct"):
+    for key in (
+        "sent",
+        "matched",
+        "complete",
+        "missing_count",
+        "token_correct",
+        "rejected",
+        "rejected_request_ids",
+        "capacity_rejected_events",
+        "unexplained_loss",
+        "admitted_completeness",
+    ):
         value = capture.get(key)
-        capture_counts[key] = value if type(value) is int and value >= 0 else None
+        if key == "admitted_completeness":
+            field_valid = type(value) in (int, float) and 0 <= value <= 1
+        else:
+            field_valid = type(value) is int and value >= 0
+        capture_counts[key] = value if field_valid else None
     if capture_counts["missing_count"] is None and isinstance(capture.get("missing_ids"), list):
         capture_counts["missing_count"] = len(capture["missing_ids"])
     return {

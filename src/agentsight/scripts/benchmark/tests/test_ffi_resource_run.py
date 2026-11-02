@@ -249,6 +249,7 @@ def test_native_ffi_host_reuses_load_capture_and_resource_reporting(
     assert measured["source"]["sha256"] == resource_inputs.digest(output / "run/agentsight")
     assert (output / "run/libagentsight.so").read_bytes() == library.read_bytes()
     assert "Scope: minimal C FFI host" in result.stdout
+    assert (output / "run/metrics-report.html").is_file()
     assert_reaped(output)
 
 

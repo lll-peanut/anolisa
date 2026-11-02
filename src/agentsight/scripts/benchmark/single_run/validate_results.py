@@ -7,6 +7,7 @@ import argparse
 import gzip
 import json
 import logging
+import os
 import re
 import sqlite3
 import time
@@ -16,6 +17,93 @@ from pathlib import Path
 from typing import Any
 
 Captured = dict[str, list[tuple[str, int | None]]]
+
+
+def load_capacity_rejected_events(path: Path | None) -> int | None:
+    """Sum capacity rejection counters across Prometheus connection states."""
+    if path is None or not path.is_file():
+        return None
+    pattern = re.compile(r"^agentsight_http_conn_removed_total\{([^}]*)\}\s+(\S+)(?:\s+\S+)?$")
+    total = 0
+    found = False
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        match = pattern.match(line.strip())
+        if not match:
+            continue
+        labels = dict(re.findall(r'(\w+)="((?:\\.|[^"\\])*)"', match.group(1)))
+        if labels.get("reason") != "capacity_rejected":
+            continue
+        try:
+            value = float(match.group(2))
+        except ValueError:
+            return None
+        if not value.is_integer() or value < 0:
+            return None
+        found = True
+        total += int(value)
+    return total if found else None
+
+
+def resolve_metrics_path(load_results: Path, metrics_file: Path | None) -> Path | None:
+    """Resolve metrics using CLI, environment, then the run artifact directory."""
+    if metrics_file is not None:
+        return metrics_file
+    configured = os.environ.get("AGENTSIGHT_METRICS_FILE")
+    if configured:
+        return Path(configured)
+    candidate = load_results.parent / "internal-metrics.prom"
+    return candidate if candidate.is_file() else None
+
+
+def incomplete_reason(value: Any) -> str | None:
+    """Return the abandonment reason recorded anywhere in a semantic event."""
+    if isinstance(value, dict):
+        metadata = value.get("metadata")
+        if isinstance(metadata, dict):
+            reason = metadata.get("abandon_reason")
+            if reason:
+                return str(reason)
+            if metadata.get("incomplete") in (True, "true", "True", 1):
+                return "incomplete"
+        for child in value.values():
+            found = incomplete_reason(child)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = incomplete_reason(child)
+            if found:
+                return found
+    return None
+
+
+def capture_status_from_event(status: str, event: Any) -> str:
+    """Tag explicit abandonment from an already-parsed semantic event."""
+    if status in {"incomplete", "interrupted"}:
+        return f"incomplete:{status}"
+    if event is None:
+        return status
+    reason = incomplete_reason(event)
+    if reason is None:
+        return status
+    if reason == "capacity_rejected":
+        return "rejected:capacity_rejected"
+    return f"incomplete:{reason}"
+
+
+def capture_status(status: str, event_json: str | None) -> str:
+    """Tag explicit abandonment without changing ordinary statuses."""
+    if not event_json:
+        return capture_status_from_event(status, None)
+    try:
+        event = json.loads(event_json)
+    except (json.JSONDecodeError, TypeError):
+        return capture_status_from_event(status, None)
+    return capture_status_from_event(status, event)
 
 
 def load_ffi_captured(
@@ -208,20 +296,22 @@ def load_captured(
                     identifiers = {
                         str(record[name]) for name in ("call_id", "trace_id") if record.get(name)
                     }
+                    event: Any = None
                     if record.get("event_json"):
                         try:
-                            identifiers.update(find_request_ids(json.loads(record["event_json"])))
+                            event = json.loads(record["event_json"])
+                            identifiers.update(find_request_ids(event))
                         except (json.JSONDecodeError, TypeError):
                             pass
+                    status = capture_status_from_event(
+                        str(record.get("status") or "complete"), event
+                    )
                     for request_id in identifiers:
                         if (not prefix or request_id.startswith(prefix)) and (
                             expected is None or request_id in expected
                         ):
                             captured.setdefault(request_id, []).append(
-                                (
-                                    str(record.get("status") or "complete"),
-                                    record.get("total_tokens"),
-                                )
+                                (status, record.get("total_tokens"))
                             )
     return captured
 
@@ -328,12 +418,15 @@ def load_captured_incremental(
                     identifiers = {
                         str(record[name]) for name in ("call_id", "trace_id") if record.get(name)
                     }
+                    event: Any = None
                     if record.get("event_json"):
                         try:
-                            identifiers.update(find_request_ids(json.loads(record["event_json"])))
+                            event = json.loads(record["event_json"])
+                            identifiers.update(find_request_ids(event))
                         except (json.JSONDecodeError, TypeError):
                             pass
-                    status = str(record.get("status") or "complete")
+                    db_status = str(record.get("status") or "complete")
+                    status = capture_status_from_event(db_status, event)
                     for request_id in identifiers:
                         if not prefix or request_id.startswith(prefix):
                             merge_capture(
@@ -345,8 +438,8 @@ def load_captured_incremental(
                     if row_id is not None:
                         # GenAI rows may receive their final token totals after
                         # becoming complete; keep refreshing requested evidence.
-                        if status == "pending" or (
-                            status == "complete"
+                        if db_status == "pending" or (
+                            db_status == "complete"
                             and expected_total_tokens is not None
                             and record.get("total_tokens") != expected_total_tokens
                             and any(
@@ -411,6 +504,25 @@ def make_report(
         for request_id in matched
         if any(status == "complete" for status, _ in captured[request_id])
     }
+    rejected = {
+        request_id
+        for request_id in matched
+        if request_id not in complete
+        and any(
+            status == "rejected:capacity_rejected" or status == "capacity_rejected"
+            for status, _ in captured[request_id]
+        )
+    }
+    conflicts = {
+        request_id
+        for request_id in matched
+        if any(status == "complete" for status, _ in captured[request_id])
+        and any(
+            status.startswith(("rejected:", "incomplete:")) or status == "interrupted"
+            for status, _ in captured[request_id]
+        )
+    }
+    admitted_sent = len(expected) - len(rejected)
     token_correct = set()
     captured_token_totals: list[int] = []
     if expected_total_tokens is not None:
@@ -453,6 +565,15 @@ def make_report(
             expected_total_tokens * len(successful) if expected_total_tokens is not None else None
         ),
         "captured_total_tokens": (sum(captured_token_totals) if captured_token_totals else None),
+        "rejected": len(rejected),
+        "rejected_request_ids": len(rejected),
+        "capacity_rejected_events": None,
+        "conflicts": len(conflicts),
+        "admitted_sent": admitted_sent,
+        "admitted_completeness": (
+            len(complete) / admitted_sent if admitted_sent > 0 else None
+        ),
+        "unexplained_loss": len(expected) - len(complete) - len(rejected),
         "missing_ids": sorted(expected - captured.keys()),
         "extra_ids": sorted(captured.keys() - expected),
     }
@@ -463,6 +584,30 @@ def make_report(
         len(token_correct) / denominator if expected_total_tokens is not None else None
     )
     return report
+
+
+def apply_capacity_rejected_metrics(report: dict[str, Any], count: int | None) -> None:
+    """Apply aggregate capacity rejections while preserving request-level attribution."""
+    report["capacity_rejected_events"] = count
+    if report.get("rejected_request_ids") is None:
+        report["rejected_request_ids"] = report.get("rejected", 0)
+    sent = report["sent"]
+    rejected_ids = report["rejected_request_ids"]
+    rejected = min(sent, max(rejected_ids, count or 0))
+    complete = report["complete"]
+    if count is not None and count > sent - complete:
+        logging.warning(
+            "capacity_rejected_events=%d exceeds missing requests=%d; report may understate end-to-end loss",
+            count,
+            sent - complete,
+        )
+    admitted_sent = max(0, sent - rejected)
+    report["rejected"] = rejected
+    report["admitted_sent"] = admitted_sent
+    report["admitted_completeness"] = (
+        min(1.0, complete / admitted_sent) if admitted_sent else None
+    )
+    report["unexplained_loss"] = max(0, sent - complete - rejected)
 
 
 def _validation_passed(report: dict[str, Any], minimum: float) -> bool:
@@ -599,6 +744,7 @@ def main() -> int:
         help="ignore database records with an earlier Unix timestamp",
     )
     parser.add_argument("--expected-total-tokens", type=int)
+    parser.add_argument("--metrics-file", type=Path)
     parser.add_argument("--min-completeness", type=float, default=0.999)
     parser.add_argument(
         "--wait-seconds",
@@ -655,6 +801,8 @@ def main() -> int:
             args.ffi_events,
         )
     report["capture_source"] = "ffi_callbacks" if args.ffi_events is not None else "sqlite"
+    metrics_path = resolve_metrics_path(args.load_results, args.metrics_file)
+    apply_capacity_rejected_metrics(report, load_capacity_rejected_events(metrics_path))
     text = json.dumps(report, indent=2, sort_keys=True)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -665,6 +813,9 @@ def main() -> int:
                 "sent": report["sent"],
                 "matched": report["matched"],
                 "complete": report["complete"],
+                "rejected": report["rejected"],
+                "capacity_rejected_events": report["capacity_rejected_events"],
+                "unexplained_loss": report["unexplained_loss"],
                 "completeness_ratio": report["completeness_ratio"],
                 "token_accuracy": report["token_accuracy"],
                 "missing_count": len(report["missing_ids"]),

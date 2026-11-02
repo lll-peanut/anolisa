@@ -233,8 +233,9 @@ A/B shows RSS reductions in MiB and relative percent. CPU reductions use percent
 points (`before - after`) and relative percent; negative values mean increased
 resource usage. A zero CPU baseline has no relative percentage. Host RAM share
 changes use percentage points. `resource-summary.json` records the measurements,
-version/tree IDs and binary hashes. Per-run CSV, capture reports and logs are under
-`run/`, or `before/` and `after/` in A/B mode.
+version/tree IDs and binary hashes. Per-run CSV, capture reports, logs, and a
+self-contained `metrics-report.html` evaluation report are under `run/`, or
+`before/` and `after/` in A/B mode.
 
 The result is VALID only if the load passes, capture completeness and token
 accuracy are each at least 99.9%, the collector survives with valid resource

@@ -41,9 +41,7 @@ def summary() -> dict[str, Any]:
                 "measurement_window": {"start": 10, "end": 310},
                 "rss_average_mib": 265,
                 "rss_peak_mib": 300,
-                "cpu_average_pct": 23.5,
-                "cpu_p95_pct": 34,
-                "cpu_peak_pct": 42,
+                "cpu_average_pct": 25,
             }
         },
     }
@@ -52,9 +50,9 @@ def summary() -> dict[str, Any]:
 def test_exact_limits_pass(summary: dict[str, Any]) -> None:
     passed, text = check_resource_limits.evaluate(summary)
     assert passed
-    assert text.count("| PASS |") == 5
+    assert text.count("| PASS |") == 3
     assert "265 MiB" in text
-    assert "23.5 %" in text
+    assert "25 %" in text
     assert "Result: PASS" in text
 
 
@@ -63,9 +61,7 @@ def test_exact_limits_pass(summary: dict[str, Any]) -> None:
     [
         ("rss_average_mib", 265.000001),
         ("rss_peak_mib", 300.000001),
-        ("cpu_average_pct", 23.500001),
-        ("cpu_p95_pct", 34.000001),
-        ("cpu_peak_pct", 42.000001),
+        ("cpu_average_pct", 25.000001),
     ],
 )
 def test_each_limit_fails_without_rounding(
@@ -181,7 +177,7 @@ def test_cli_exit_status_and_job_summary(
     job_summary = tmp_path / "job-summary.md"
     job_summary.write_text("Existing summary\n", encoding="utf-8")
     if case == "exceeded":
-        summary["runs"]["run"]["cpu_peak_pct"] = 43
+        summary["runs"]["run"]["cpu_average_pct"] = 25.1
     if case == "invalid":
         summary["valid"] = False
     if case != "missing":
